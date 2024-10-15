@@ -8,7 +8,7 @@ terraform {
 }
 
 locals {
-  cloudspace_name = "${var.region}-cloudspace"
+  cloudspace_name = "${try(length(var.cloudspace_prefix) > 0 ? var.cloudspace_prefix : var.type)}-${var.region}"
 }
 
 provider "spot" {
@@ -21,13 +21,14 @@ resource "spot_cloudspace" "this" {
   hacontrol_plane    = false
   preemption_webhook = var.slack_webhook
   deployment_type    = var.type
+  wait_until_ready   = false
 }
 
 data "spot_serverclasses" "all" {
   filters = [
     {
       name   = "resources.memory"
-      values = [">16GB"]
+      values = [">${try(var.minimum_size, 8)}GB"]
     }
   ]
 }
@@ -37,13 +38,17 @@ data "spot_serverclass" "this" {
   name     = each.key
 }
 
-resource "spot_spotnodepool" "this" {
-  for_each = {
+# Dynamic spotnodepool resource with additional logic for gen2 deployment_type
+
+resource "spot_spotnodepool" "dynamic" {
+  for_each = var.dynamic_spotnodepool ? {
     for name, details in data.spot_serverclass.this : name => details
     if details.region == var.region &&
     details.status.spot_pricing.hammer_price_per_hour <= var.bid_price &&
-    details.status.spot_pricing.market_price_per_hour <= var.bid_price
-  }
+    details.status.spot_pricing.market_price_per_hour <= var.bid_price &&
+    !can(regex("^${var.static_server_class}", name)) &&
+    !(var.type == "gen2" && can(regex("\\.bm2\\.", name)))
+  } : {}
 
   cloudspace_name      = local.cloudspace_name
   server_class         = each.key
@@ -51,24 +56,19 @@ resource "spot_spotnodepool" "this" {
   desired_server_count = var.server_count
 }
 
-resource "null_resource" "wait_for_cloudspace" {
-  provisioner "local-exec" {
-    command = "sleep 600"
-  }
+# Static spotnodepool resource with additional logic for gen2 deployment_type
+resource "spot_spotnodepool" "static" {
+  for_each = var.static_spotnodepool && !(var.type == "gen2" && can(regex("\\.bm\\.", var.static_server_class))) ? {
+    static_pool = {
+      cloudspace_name      = local.cloudspace_name
+      server_class         = var.static_server_class
+      bid_price            = var.static_bid_price
+      desired_server_count = var.static_server_count
+    }
+  } : {}
 
-  depends_on = [spot_cloudspace.this]
+  cloudspace_name      = each.value.cloudspace_name
+  server_class         = each.value.server_class
+  bid_price            = each.value.bid_price
+  desired_server_count = each.value.desired_server_count
 }
-
-data "spot_kubeconfig" "this" {
-  cloudspace_name = local.cloudspace_name
-
-  depends_on = [null_resource.wait_for_cloudspace]
-}
-
-resource "local_file" "kubeconfig_yaml" {
-  content  = data.spot_kubeconfig.this.raw
-  filename = "${path.module}/kubeconfig-${local.cloudspace_name}.yaml"
-
-  depends_on = [data.spot_kubeconfig.this]
-}
-
